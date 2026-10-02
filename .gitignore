@@ -1,0 +1,14 @@
+node_modules/
+data/
+.env
+*.log
+.env.*
+!.env.example
+.venv/
+.tools/
+vendor/
+__pycache__/
+*.pyc
+*.egg-info/
+.claude/settings.local.json
+claude-mcp.example.json
