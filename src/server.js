@@ -9,6 +9,8 @@ import { fetchBoard } from './providers.js';
 import { discoveryLinks } from './discovery.js';
 import { observationSchema, normalizeObservation, sponsorshipEvidence } from './evidence.js';
 import { draftingContext, BROWSER_WORKFLOW } from './drafting.js';
+import { linkedInTools } from './linkedin.js';
+import { runBridge } from './python_bridge.js';
 
 const roleSchema = z.array(z.enum(ROLES)).min(1).max(4).transform(roles => [...new Set(roles)]);
 const boardSchema = z.strictObject({ provider: z.enum(['greenhouse', 'lever']), identifier: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$/) });
@@ -20,7 +22,7 @@ const summary = record => {
   return { ...rest, sponsorship: sponsorship ? { classification: sponsorship.classification, note: sponsorship.note } : null, excerpt: text?.slice(0, 350) ?? '' };
 };
 
-export function createServer(store, { fetchBoardImpl = fetchBoard } = {}) {
+export function createServer(store, { fetchBoardImpl = fetchBoard, runBridgeImpl = runBridge } = {}) {
   const server = new McpServer({ name: 'finance-job-search', version: '0.1.0' });
   const register = (name, description, inputSchema, fn, readOnly = true, openWorld = false) => {
     server.registerTool(name, {
@@ -112,6 +114,7 @@ export function createServer(store, { fetchBoardImpl = fetchBoard } = {}) {
   register('drafting_context', 'Return source-backed context for host Claude to draft outreach or truthful resume suggestions. Does not generate via another model or send anything. Resume text is not saved.', {
     purpose: z.enum(['networking', 'resume_tailoring']), jobId: idSchema.optional(), contactId: idSchema.optional(), resumeText: z.string().max(30000).optional(),
   }, args => draftingContext(args, store.snapshot()));
+  for (const tool of linkedInTools({ runBridgeImpl, roleSchema, defaultRoles: () => store.snapshot().preferences.roles })) register(...tool);
   server.registerPrompt('linkedin_research', { description: 'Browser-assisted LinkedIn jobs, recent hires, and outreach workflow; requires separate host browser tools.' }, () => ({
     messages: [{ role: 'user', content: { type: 'text', text: BROWSER_WORKFLOW } }],
   }));

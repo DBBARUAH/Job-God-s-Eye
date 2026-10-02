@@ -33,6 +33,10 @@ CHALLENGE_SELECTOR = (
     'input[name="pin"], input[autocomplete="one-time-code"]'
 )
 AUTH_SELECTOR = 'input[type="password"], form[action*="login"], .authwall'
+SEARCH_CONTENT = "div.base-search-card"
+DETAIL_CONTENT = "div.show-more-less-html__markup"
+# Public job pages embed a hidden contextual sign-in modal; it is not a gate.
+INERT_SELECTOR = '[hidden], .hidden, [aria-hidden="true"], [class*="sign-in-modal"], template, noscript'
 
 
 class BridgeError(Exception):
@@ -65,12 +69,18 @@ class TextParser(HTMLParser):
             self.parts.append(data)
 
 
-def clean_text(value, maximum=12000) -> str:
+def clean_text(value, maximum=12000, html=False) -> str:
+    """Normalize vendor text. Only descriptions are HTML; titles, names and post
+    text are already plain, so parsing them as HTML would drop literal '<'."""
     if not isinstance(value, str):
         return ""
-    parser = TextParser()
-    parser.feed(unescape(unescape(value)))
-    text = " ".join(parser.parts)
+    if html:
+        parser = TextParser()
+        parser.feed(unescape(unescape(value)))
+        parser.close()  # Flush text buffered after a trailing '&' (e.g. "FP&A").
+        text = " ".join(parser.parts)
+    else:
+        text = value
     # Remove whole email-bearing tokens, including Unicode addresses and mailto URLs.
     text = re.sub(r"\S*@\S*", "[redacted]", text)
     text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
@@ -136,8 +146,12 @@ def validate(payload):
     }
 
 
-def html_gate(html, url="", allow_login=False):
-    """Check visible gate markup, not incidental sign-in links in public pages."""
+def html_gate(html, url="", allow_login=False, content_selector=None):
+    """Check visible gate markup, not incidental sign-in links in public pages.
+
+    Public guest pages carry sign-in modals and upsell forms beside real content.
+    With content_selector, sign-in markup is a gate only when that content is absent.
+    """
     from bs4 import BeautifulSoup
 
     path = urlsplit(url).path
@@ -146,8 +160,11 @@ def html_gate(html, url="", allow_login=False):
     soup = BeautifulSoup(html, "html.parser")
     if soup.select_one(CHALLENGE_SELECTOR):
         return "blocked"
-    # Restrict textual detection to visible text; script bundles often mention captcha.
+    has_content = bool(content_selector and soup.select_one(content_selector))
+    # Restrict detection to visible markup; script bundles often mention captcha.
     for tag in soup(["script", "style"]):
+        tag.decompose()
+    for tag in soup.select(INERT_SELECTOR):
         tag.decompose()
     visible = soup.get_text(" ", strip=True).lower()
     if any(s in visible for s in ("too many requests", "rate limit exceeded")):
@@ -157,7 +174,11 @@ def html_gate(html, url="", allow_login=False):
         "complete the captcha", "unusual activity", "your account has been restricted",
     )):
         return "blocked"
-    if not allow_login and (AUTH_PATH.search(path) or soup.select_one(AUTH_SELECTOR)):
+    if allow_login:
+        return None
+    if AUTH_PATH.search(path):
+        return "blocked"
+    if soup.select_one(AUTH_SELECTOR) and not has_content:
         return "blocked"
     return None
 
@@ -231,9 +252,13 @@ class GuardedSession:
         search = url in ("https://www.linkedin.com" + SEARCH_PATH,
                          "https://www.linkedin.com" + SEARCH_PATH + "?")
         if not search and not JOB_URL.fullmatch(url):
+            # The vendor builds detail URLs from card hrefs; a non-numeric ID means
+            # LinkedIn markup changed, not that access was blocked.
+            if re.fullmatch(r"https://www\.linkedin\.com/jobs/view/[A-Za-z0-9_-]{1,200}", url):
+                self.fail("unrecognized_page", "job_id_unrecognized")
             self.fail("blocked", "url_not_allowed")
         if self.requests >= self.budget:
-            self.fail("network_error", "request_budget_exceeded")
+            self.fail("limit_reached", "request_budget_exceeded")
         if set(kwargs) - {"params", "allow_redirects", "timeout", "stream"}:
             self.fail("blocked", "request_options_not_allowed")
         params = kwargs.get("params") or {}
@@ -275,12 +300,13 @@ class GuardedSession:
                     self.fail("unrecognized_page", "body_limit_exceeded")
                 data.extend(chunk)
             html = bytes(data).decode("utf-8", errors="replace")
-            gate = html_gate(html, response.url or url)
+            gate = html_gate(html, response.url or url,
+                             content_selector=SEARCH_CONTENT if search else DETAIL_CONTENT)
             if gate:
                 self.fail(gate, "access_gate")
             soup = BeautifulSoup(html, "html.parser")
             if search:
-                cards = soup.select("div.base-search-card")
+                cards = soup.select(SEARCH_CONTENT)
                 self.cards_seen += len(cards)
                 if not cards:
                     # Empty guest fragments are LinkedIn's end-of-results response.
@@ -292,7 +318,7 @@ class GuardedSession:
                 elif any(not card.select_one("a.base-card__full-link[href]") or
                          not card.select_one("span.sr-only") for card in cards):
                     self.fail("unrecognized_page", "job_card_markup_changed")
-            elif not soup.select_one("div.show-more-less-html__markup"):
+            elif not soup.select_one(DETAIL_CONTENT):
                 self.fail("unrecognized_page", "description_markup_missing")
             # A bounded, detached Response keeps the actual vendor parser unchanged.
             result = requests.Response()
@@ -322,7 +348,7 @@ def normalize_job(job, observed):
     if not title or title == "N/A":
         return None
     location = getattr(job, "location", None)
-    text = clean_text(getattr(job, "description", None))
+    text = clean_text(getattr(job, "description", None), html=True)
     published = getattr(job, "date_posted", None)
     return {
         "title": title,
@@ -330,7 +356,9 @@ def normalize_job(job, observed):
         "location": clean_text(location.display_location() if location else "", 500),
         "url": url,
         "text": text,
-        "publishedAt": published.isoformat() if isinstance(published, date) else None,
+        # The guest card carries a calendar date only; the vendor stores midnight.
+        "publishedAt": (published.date() if isinstance(published, datetime) else published).isoformat()
+        if isinstance(published, date) else None,
         "observedAt": observed,
         "descriptionAvailable": bool(text),
     }
@@ -351,7 +379,9 @@ def jobs(args):
             site_type=[Site.LINKEDIN], search_term=args["searchTerm"],
             location=args["location"], results_wanted=args["limit"],
             hours_old=args.get("hoursOld"), fetch_description=True,
-            description_format=DescriptionFormat.PLAIN,
+            # HTML, not PLAIN: the vendor's plain converter keeps <script> text.
+            # clean_text drops hidden elements and redacts emails itself.
+            description_format=DescriptionFormat.HTML,
         )
         try:
             response = scraper.scrape(scraper_input)
@@ -414,8 +444,11 @@ def post_facts(posts, limit=5):
         ):
             source = None
         if text:
-            # Vendor dates are relative/ambiguous. Do not manufacture a timestamp.
-            result.append({"text": text, "source": source, "publishedAt": None})
+            # Vendor dates are relative/ambiguous ("3d", "2w"). Report the label as
+            # observed and do not manufacture a timestamp from it.
+            relative = clean_text(getattr(post, "posted_date", None), 40)
+            result.append({"text": text, "source": source, "publishedAt": None,
+                           "relativeAge": relative if re.fullmatch(r"\d+\s*[hdwmy]", relative) else None})
     return result
 
 
@@ -582,9 +615,20 @@ async def browser_operation(mode, args):
                         await browser.close()
     except BridgeError:
         raise
-    except Exception:
+    except Exception as exc:
         # Do not expose exception messages: browser/vendor diagnostics may contain PII.
-        raise BridgeError("network_error", "browser_operation_failed") from None
+        raise vendor_error(exc) from None
+
+
+def vendor_error(exc):
+    """Map vendor access exceptions by type so blocks are not reported as outages."""
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    if "RateLimitError" in names:
+        # The vendor raises this for checkpoints and CAPTCHAs as well as throttling.
+        return BridgeError("blocked", "vendor_access_gate")
+    if "AuthenticationError" in names:
+        return BridgeError("auth_required", "vendor_authentication")
+    return BridgeError("network_error", "browser_operation_failed")
 
 
 async def browser_availability():
@@ -677,7 +721,12 @@ def read_request(stream):
 
 def main(stdin=None, stdout=None):
     stdin = stdin if stdin is not None else sys.stdin.buffer
-    stdout = stdout if stdout is not None else sys.stdout
+    if stdout is None:
+        # Reserve the real fd 1 for the single JSON line. Child processes and native
+        # code inherit fd 1, so point it at stderr for everything else.
+        sys.stdout.flush()
+        stdout = os.fdopen(os.dup(1), "w", encoding="ascii")
+        os.dup2(2, 1)
     # Silence all library stdout, including import-time prints. Never emit library
     # diagnostics/exception messages because they can include emails or profile data.
     logging.disable(logging.CRITICAL)

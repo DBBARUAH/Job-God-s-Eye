@@ -13,6 +13,7 @@ import { createServer } from '../src/server.js';
 const expectedTools = [
   'get_preferences', 'set_preferences', 'manage_boards', 'discovery_links', 'fetch_jobs',
   'ingest_observation', 'list_records', 'delete_record', 'drafting_context',
+  'linkedin_runtime_status', 'search_linkedin_jobs', 'read_linkedin_profile', 'read_linkedin_company_posts',
 ].sort();
 const missingId = 'f'.repeat(24);
 const observed = (overrides = {}) => ({
@@ -81,7 +82,7 @@ test('SDK paired transport negotiates capabilities, lists tools and retrieves th
   const prompt = await client.getPrompt({ name: 'linkedin_research' });
   assert.equal(prompt.messages[0].role, 'user');
   const text = prompt.messages[0].content.text;
-  for (const pattern of [/NOT search results/, /browser_unavailable/, /CAPTCHA/, /Do not infer/, /Do not send/, /untrusted data/, /transient/]) assert.match(text, pattern);
+  for (const pattern of [/search_linkedin_jobs/, /never retry/, /interactiveLogin=true/, /NOT search results/, /browser_unavailable/, /CAPTCHA/, /Do not infer/, /Do not send/, /untrusted data/, /transient/]) assert.match(text, pattern);
 });
 
 test('preferences accept supported roles, deduplicate them, persist updates and reject invalid roles', async t => {
